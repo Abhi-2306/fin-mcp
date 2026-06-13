@@ -11,14 +11,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import {
-  AlphaVantageError,
-  getCompanyOverview,
-  getEarnings,
-  getGlobalQuote,
-  getTopMovers,
-  type CompanyOverview,
-} from "./alphavantage.ts";
+import { AlphaVantageProvider } from "./alphavantage.ts";
+import { CachingFinanceProvider } from "./cache.ts";
+import { requireApiKey } from "./config.ts";
+import { ResilientProvider } from "./limiter.ts";
+import { ProviderError, type FinanceProvider } from "./provider.ts";
+import { checkCriteria, settleAll, type ScreenCriteria } from "./screening.ts";
 
 /* --------------------------------- helpers -------------------------------- */
 
@@ -39,7 +37,7 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof err
   try {
     return await fn();
   } catch (err) {
-    if (err instanceof AlphaVantageError) {
+    if (err instanceof ProviderError) {
       const prefix = {
         bad_ticker: "Invalid ticker / no data",
         rate_limit: "Alpha Vantage rate limit reached",
@@ -70,13 +68,20 @@ const fmtMarketCap = (n: number): string => {
 
 /* --------------------------------- server --------------------------------- */
 
-const server = new McpServer({
-  name: "mcp-finance-server",
-  version: "1.0.0",
-});
+/**
+ * Build the MCP server and register all six tools against the supplied
+ * `FinanceProvider`. The provider is injected (not hard-wired) so production
+ * can pass the cached/resilient Alpha Vantage stack while the eval harness
+ * passes a `MockFinanceProvider` — the tool handlers are identical either way.
+ */
+export function createServer(provider: FinanceProvider): McpServer {
+  const server = new McpServer({
+    name: "mcp-finance-server",
+    version: "1.0.0",
+  });
 
-/* 1. get_stock_price -------------------------------------------------------- */
-server.registerTool(
+  /* 1. get_stock_price -------------------------------------------------------- */
+  server.registerTool(
   "get_stock_price",
   {
     title: "Get Stock Price",
@@ -86,7 +91,7 @@ server.registerTool(
   },
   async ({ ticker }) =>
     guard(async () => {
-      const q = await getGlobalQuote(ticker);
+      const q = await provider.getQuote(ticker);
       return json({
         ticker: q.symbol,
         price: q.price,
@@ -110,7 +115,7 @@ server.registerTool(
   },
   async ({ ticker }) =>
     guard(async () => {
-      const o = await getCompanyOverview(ticker);
+      const o = await provider.getOverview(ticker);
       return json({
         ticker: o.symbol,
         name: o.name,
@@ -141,7 +146,8 @@ server.registerTool(
   },
   async ({ ticker, quarters }) =>
     guard(async () => {
-      const earnings = await getEarnings(ticker, quarters);
+      // Provider returns all available quarters; slice to the requested count.
+      const earnings = (await provider.getEarnings(ticker)).slice(0, quarters);
       return json({
         ticker,
         quarters: earnings.map((e) => ({
@@ -172,32 +178,47 @@ server.registerTool(
     guard(async () => {
       // Dedupe while preserving order.
       const unique = [...new Set(tickers)];
-      const rows = await Promise.all(
-        unique.map(async (t) => {
-          try {
-            const [quote, overview] = await Promise.all([
-              getGlobalQuote(t),
-              getCompanyOverview(t).catch(() => null as CompanyOverview | null),
-            ]);
-            return {
-              ticker: t,
-              price: quote.price,
-              changePercent: quote.changePercent,
-              volume: quote.volume,
-              name: overview?.name ?? null,
-              sector: overview?.sector ?? null,
-              marketCap: overview?.marketCap ?? null,
-              marketCapFormatted: overview ? fmtMarketCap(overview.marketCap) : null,
-              peRatio: overview?.peRatio ?? null,
-              week52High: overview?.week52High ?? null,
-              week52Low: overview?.week52Low ?? null,
-            };
-          } catch (err) {
-            return { ticker: t, error: err instanceof Error ? err.message : String(err) };
-          }
-        }),
-      );
-      return json({ comparison: rows });
+
+      // Fetch each ticker, capturing per-ticker failures explicitly. The quote
+      // is the essential comparison datum, so a ticker is only "compared" if the
+      // quote succeeds; the overview is a best-effort supplement (may be null).
+      const settled = await settleAll(unique, async (t) => {
+        const quote = await provider.getQuote(t);
+        const overview = await provider.getOverview(t).catch(() => null);
+        return { quote, overview };
+      });
+
+      const comparison = [];
+      const failures = [];
+      for (const r of settled) {
+        if (!r.ok) {
+          failures.push({ ticker: r.ticker, reason: r.reason });
+          continue;
+        }
+        const { quote, overview } = r.value;
+        comparison.push({
+          ticker: r.ticker,
+          price: quote.price,
+          changePercent: quote.changePercent,
+          volume: quote.volume,
+          name: overview?.name ?? null,
+          sector: overview?.sector ?? null,
+          marketCap: overview?.marketCap ?? null,
+          marketCapFormatted: overview ? fmtMarketCap(overview.marketCap) : null,
+          peRatio: overview?.peRatio ?? null,
+          week52High: overview?.week52High ?? null,
+          week52Low: overview?.week52Low ?? null,
+        });
+      }
+
+      // Explicit counts so a partial result is never mistaken for a complete one.
+      return json({
+        requested: unique.length,
+        compared: comparison.length,
+        failed: failures.length,
+        comparison,
+        failures,
+      });
     }),
 );
 
@@ -211,7 +232,7 @@ server.registerTool(
   },
   async () =>
     guard(async () => {
-      const movers = await getTopMovers();
+      const movers = await provider.getTopMovers();
       return json({
         lastUpdated: movers.lastUpdated,
         topGainers: movers.topGainers,
@@ -244,53 +265,89 @@ server.registerTool(
   async ({ tickers, sector, minPe, maxPe, minMarketCap }) =>
     guard(async () => {
       const unique = [...new Set(tickers)];
-      const evaluated = await Promise.all(
-        unique.map(async (t) => {
-          try {
-            return await getCompanyOverview(t);
-          } catch {
-            return null;
-          }
-        }),
-      );
+      const criteria: ScreenCriteria = { sector, minPe, maxPe, minMarketCap };
 
-      const matches = evaluated
-        .filter((o): o is CompanyOverview => o !== null)
-        .filter((o) => {
-          if (sector && o.sector.toLowerCase() !== sector.toLowerCase()) return false;
-          if (minMarketCap !== undefined && o.marketCap < minMarketCap) return false;
-          if (minPe !== undefined && (o.peRatio === null || o.peRatio < minPe)) return false;
-          if (maxPe !== undefined && (o.peRatio === null || o.peRatio > maxPe)) return false;
-          return true;
-        })
-        .map((o) => ({
+      // Fetch every candidate, capturing fetch failures explicitly so they are
+      // never silently dropped (the original silent-failure bug).
+      const settled = await settleAll(unique, (t) => provider.getOverview(t));
+
+      const results = []; // matched: passed all criteria
+      const rejected = []; // did_not_match: fetched fine but failed a criterion
+      const failures = []; // failed: could not fetch at all
+
+      for (const r of settled) {
+        if (!r.ok) {
+          failures.push({ ticker: r.ticker, reason: r.reason });
+          continue;
+        }
+        const o = r.value;
+        const failedCriteria = checkCriteria(o, criteria);
+        const row = {
           ticker: o.symbol,
           name: o.name,
           sector: o.sector,
           marketCap: o.marketCap,
           marketCapFormatted: fmtMarketCap(o.marketCap),
           peRatio: o.peRatio,
-        }));
+        };
+        if (failedCriteria.length === 0) {
+          results.push(row);
+        } else {
+          rejected.push({ ...row, failedCriteria });
+        }
+      }
 
+      // Three explicit states + counts: matched / didNotMatch / failed.
+      // matched + didNotMatch + failed === evaluated, always.
       return json({
-        criteria: { sector: sector ?? null, minPe: minPe ?? null, maxPe: maxPe ?? null, minMarketCap: minMarketCap ?? null },
+        criteria: {
+          sector: sector ?? null,
+          minPe: minPe ?? null,
+          maxPe: maxPe ?? null,
+          minMarketCap: minMarketCap ?? null,
+        },
         evaluated: unique.length,
-        matched: matches.length,
-        results: matches,
+        matched: results.length,
+        didNotMatch: rejected.length,
+        failed: failures.length,
+        results,
+        rejected,
+        failures,
       });
     }),
-);
+  );
+
+  return server;
+}
 
 /* --------------------------------- startup -------------------------------- */
 
+/**
+ * Compose the production provider stack. Layered, outermost first:
+ *   CachingFinanceProvider → in-memory TTL cache + single-flight
+ *     └─ ResilientProvider → concurrency limiter (≤2) + retry/backoff
+ *         └─ AlphaVantageProvider → fetch + parse
+ */
+function buildProvider(): FinanceProvider {
+  return new CachingFinanceProvider(new ResilientProvider(new AlphaVantageProvider()));
+}
+
 async function main() {
+  // Fail fast: refuse to start without a real Alpha Vantage key (exits if missing).
+  requireApiKey();
+
+  const server = createServer(buildProvider());
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Never write to stdout: it is the MCP transport. Logs go to stderr.
   console.error("mcp-finance-server running on stdio");
 }
 
-main().catch((err) => {
-  console.error("Fatal error starting mcp-finance-server:", err);
-  process.exit(1);
-});
+// Only launch when run as the entry point — importing this module (e.g. from
+// the eval harness or tests) must not start the stdio server or require a key.
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("Fatal error starting mcp-finance-server:", err);
+    process.exit(1);
+  });
+}
