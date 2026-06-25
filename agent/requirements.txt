@@ -1,0 +1,19 @@
+# --- MCP connection (Phase 1+) ---
+# The MCP Python SDK: stdio client + ClientSession that speaks JSON-RPC to the
+# TypeScript fin-mcp server over a subprocess's stdin/stdout.
+mcp>=1.2.0
+
+# --- Tool loading (Phase 2+) ---
+# Converts MCP tools (discovered over the protocol) into LangChain tool objects
+# the model can call.
+langchain-mcp-adapters>=0.1.0
+
+# --- LLM + agent graph (Phase 3+) ---
+# langchain-groq: the Groq chat-model wrapper (LangChain ChatModel interface).
+# langgraph:      StateGraph / nodes / edges / prebuilt ToolNode for the agent.
+langchain-groq>=0.2.0
+langgraph>=0.2.50
+
+# --- Config ---
+# Loads GROQ_API_KEY from agent/.env.
+python-dotenv>=1.0.0
