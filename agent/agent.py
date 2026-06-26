@@ -51,7 +51,11 @@ SYSTEM_PROMPT = (
     "market data from an MCP server: current prices, company overviews, earnings, "
     "side-by-side comparisons, top movers, and screening. Use the tools to answer "
     "with real data — never invent numbers. Call the most specific tool(s) for the "
-    "question, then give a concise, well-reasoned answer grounded in the results."
+    "question, then give a concise, well-reasoned answer grounded in the results. "
+    "IMPORTANT when calling tools: only include OPTIONAL parameters when you have a "
+    "real, concrete value for them. Never pass empty strings (\"\") or placeholder "
+    "zeros for optional fields — simply omit them. (For example, to screen by P/E "
+    "only, pass just `tickers` and `maxPe`; do not include `sector`.)"
 )
 
 

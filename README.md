@@ -303,6 +303,91 @@ bun run typecheck  # tsc --noEmit
 
 **Eval harness** (`eval/run.ts`, run by `bun run eval`) injects a `MockFinanceProvider` (implementing `FinanceProvider`) with canned fixtures, wraps it in the *real* cache + resilience layers, and drives the *real* MCP tool handlers through an in-memory client⇄server pair. It runs 18 cases — happy paths for all six tools, schema validation (`""` and a 15-char ticker rejected pre-handler; `"aapl"` → `"AAPL"`), error handling (`bad_ticker` classification, rate-limit after retries), the three-state `compare`/`screen` invariants, and cache/single-flight/no-retry-on-bad-ticker behavior — and prints a PASS/FAIL scorecard (exit code 1 if any case fails, so it can gate CI). The `--live` flag swaps in the real Alpha Vantage provider for a couple of read-only spot-checks.
 
+## Agent (Python LangGraph)
+
+The `agent/` folder contains a separate **Python** program that connects to this TypeScript server as a real **MCP client** and drives it with an LLM (**Groq**, `llama-3.3-70b-versatile`, free tier). It's a single-agent **reason → act → observe** loop built on LangGraph — not a multi-agent framework. The TS server is untouched; the agent spawns it (`bun run src/index.ts`) as a subprocess over stdio, exactly like Claude Desktop would.
+
+### Architecture (cross-language)
+
+```
+  You ──question──▶ LangGraph agent (Python)
+                      │  ChatGroq (llama-3.3-70b) decides which tool to call
+                      ▼
+                    MCP client  ──stdio / JSON-RPC──▶  fin-mcp server (TypeScript)
+                                                          → cache → resilient → Alpha Vantage
+                      ▲                                              │
+                      └──────────── tool result ◀───────────────────┘
+                      │  model observes results, loops or synthesizes
+                      ▼
+                  final answer
+```
+
+Three libraries, three jobs (the distinction worth knowing):
+
+- **`mcp` (MCP Python SDK)** — the transport. `ClientSession` over stdio speaks JSON-RPC to the server.
+- **`langchain-mcp-adapters`** — the bridge. `load_mcp_tools(session)` turns the server's MCP tools into LangChain `BaseTool` objects. This is the *only* MCP-aware glue; above it nothing knows the tools came from MCP.
+- **`langgraph` + `langchain-groq`** — the agent. LangGraph orchestrates; the Groq wrapper is the LLM.
+
+### The graph structure
+
+```
+        ┌─────────┐   tool_calls?   ┌─────────┐
+START ─▶│  agent  │────────yes─────▶│  tools  │
+        │ (reason)│                 │(act+obs)│
+        └─────────┘◀────────────────└─────────┘
+             │  no tool_calls (final answer)
+             ▼
+            END
+```
+
+- **State**: `AgentState` = `{messages: Annotated[list, add_messages]}`. The `add_messages` reducer is the message-accumulator pattern — each node *appends* to history (user turn, AI turns, tool results) rather than replacing it.
+- **agent node**: calls the Groq model (bound to the tools) → emits either `tool_calls` or a final answer.
+- **tools node**: LangGraph's prebuilt **`ToolNode`** executes the requested tool calls and appends one `ToolMessage` each (used prebuilt because it already handles parsing, parallel calls, and error→message formatting).
+- **conditional edge**: `agent → tools` if the model asked for tools, else `agent → END`. `tools → agent` closes the loop.
+- **step cap**: `recursion_limit=15` at invoke time so it can never loop forever.
+- **rate limits**: a 0.5 s pre-call delay + exponential backoff on Groq 429s (free tier is 30 rpm / 1 K/day).
+
+### LangGraph vs LangChain (one-line version)
+
+> **LangGraph** is the *state machine* (StateGraph, nodes, edges, conditional routing, `add_messages` state, `ToolNode`, recursion limit). **LangChain** provides the *things that flow through it* (`ChatGroq` model, `bind_tools`, message types, `BaseTool` objects). LangGraph orchestrates; LangChain supplies the model/messages/tools.
+
+### How to run
+
+One-time setup (uses **`py`** for the system Python; everything else uses the venv):
+
+```bash
+cd agent
+py -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.txt
+cp .env.example .env          # then set GROQ_API_KEY (free: https://console.groq.com/keys)
+```
+
+Then (the scripts spawn the TS server automatically — no separate start needed):
+
+```bash
+# Phase 1 — prove the cross-language MCP connection (no LLM): list the 6 tools
+.venv/Scripts/python.exe phase1_connect.py
+
+# Phase 2 — load the MCP tools as LangChain tools (no LLM)
+.venv/Scripts/python.exe phase2_load_tools.py
+
+# Phase 3 — single-tool question
+.venv/Scripts/python.exe phase3_run.py "what's Apple's stock price?"
+
+# Phase 4 — multi-step: streamed reason → act → observe
+.venv/Scripts/python.exe phase4_multistep.py "Compare AAPL and MSFT and say which is stronger."
+
+# Phase 5 — tool-selection eval + JSONL tracing
+.venv/Scripts/python.exe eval_agent.py           # mocked: deterministic, offline, free
+.venv/Scripts/python.exe eval_agent.py --live     # real Groq + real server (uses quota)
+```
+
+> The **agent eval is distinct from the server eval above.** The server eval (`bun run eval`) checks *data reliability* — do the tools return correct values? The agent eval (`eval_agent.py`) checks *tool selection* — given a question, does the agent pick the right tool and produce a non-empty answer? Mocked mode uses a deterministic fake model + stub tools (tests the graph wiring/harness with no quota); `--live` tests the real model's choices. Every run writes a JSONL trace to `agent/traces/` (timestamp, node, model reasoning, tool name+args, result summary, latency).
+
+### Requirements (Python side)
+
+`agent/requirements.txt`: `mcp`, `langchain-mcp-adapters`, `langchain-groq`, `langgraph`, `python-dotenv`. Needs Python 3.12+. The `agent/.venv` and `agent/.env` are gitignored.
+
 ## Project layout
 
 ```
@@ -322,6 +407,18 @@ fin-mcp/
 ├── eval/
 │   ├── run.ts                # eval harness + scorecard (18 cases via in-memory MCP client)
 │   └── fixtures.ts           # MockFinanceProvider + canned fixtures
+├── agent/                    # Python LangGraph agent (MCP client; see "Agent" section)
+│   ├── mcp_config.py          # how to spawn the TS server over stdio (bun-path resolution)
+│   ├── phase1_connect.py      # Phase 1: raw MCP connection + tools/list
+│   ├── phase2_load_tools.py   # Phase 2: MCP tools → LangChain tools
+│   ├── agent.py               # Phase 3: the StateGraph reason→act→observe agent (the core)
+│   ├── phase3_run.py          # Phase 3: run a single-tool question
+│   ├── phase4_multistep.py    # Phase 4: streamed multi-step demonstration
+│   ├── runner.py              # shared streaming runner → RunResult (+ optional tracing)
+│   ├── tracing.py             # Phase 5: JSONL Tracer
+│   ├── eval_agent.py          # Phase 5: tool-selection eval (mocked default, --live flag)
+│   ├── requirements.txt
+│   └── .env.example
 ├── package.json
 ├── tsconfig.json
 └── README.md
