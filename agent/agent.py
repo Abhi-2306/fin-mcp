@@ -68,8 +68,12 @@ class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
 
 
-def make_model() -> ChatGroq:
-    """LangChain: construct the Groq chat model (fail-fast if the key is missing)."""
+def make_model(model_name: str = MODEL_NAME) -> ChatGroq:
+    """LangChain: construct the Groq chat model (fail-fast if the key is missing).
+
+    `model_name` is configurable so the multi-model comparison (compare_models.py)
+    can build the same agent graph against different Groq models.
+    """
     # Load agent/.env regardless of the current working directory.
     load_dotenv(Path(__file__).resolve().parent / ".env")
     import os
@@ -82,7 +86,7 @@ def make_model() -> ChatGroq:
         )
 
     return ChatGroq(
-        model=MODEL_NAME,
+        model=model_name,
         temperature=0,        # deterministic tool selection
         max_retries=2,        # ChatGroq's own retry on transient/429 errors
     )
