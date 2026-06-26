@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from langchain_core.messages import HumanMessage
 
 from tracing import Tracer
+from weave_setup import op
 
 
 @dataclass
@@ -34,6 +35,7 @@ def _summary(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[:limit] + " ..."
 
 
+@op  # traced as a Weave op when Weave is active; a plain call otherwise
 async def run_agent(
     graph,
     question: str,

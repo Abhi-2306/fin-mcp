@@ -1,0 +1,5 @@
+# OPTIONAL — W&B Weave observability (LLM/agent tracing + eval tracking).
+# NOT required to run the agent; install only if you want hosted tracing in W&B.
+#   .venv/Scripts/python.exe -m pip install -r requirements-weave.txt
+# Then set WANDB_API_KEY (https://wandb.ai/authorize) and pass --weave.
+weave>=0.51.0

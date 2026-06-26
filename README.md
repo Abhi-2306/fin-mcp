@@ -386,7 +386,70 @@ Then (the scripts spawn the TS server automatically — no separate start needed
 
 ### Requirements (Python side)
 
-`agent/requirements.txt`: `mcp`, `langchain-mcp-adapters`, `langchain-groq`, `langgraph`, `python-dotenv`. Needs Python 3.12+. The `agent/.venv` and `agent/.env` are gitignored.
+`agent/requirements.txt`: `mcp`, `langchain-mcp-adapters`, `langchain-groq`, `langgraph`, `python-dotenv`. Needs Python 3.12+. The `agent/.venv` and `agent/.env` are gitignored. W&B Weave is an *optional* extra (`requirements-weave.txt`), never required by the core loop.
+
+## Metrics & Observability
+
+Three layers of measurement sit on top of the agent. All default to **offline/mocked** so they cost no API quota; live runs are opt-in.
+
+### 1. Tier-1 performance metrics — `metrics.py`
+
+Runs a fixed 10-question workload with deliberately overlapping tickers (first 5 introduce AAPL/MSFT/TSLA = *cold*; last 5 repeat them = *warm*) and reports, each with a one-line note on how it was measured:
+
+| Metric | How measured | Example (real, direct mode) |
+|--------|-------------|------------------------------|
+| **Cache hit rate** | server's final `[cache]` stderr line; `hits/(hits+misses)` | 50% (5 hits / 5 misses) |
+| **Upstream API calls** | `= misses` | 5 |
+| **API-call reduction** | on = misses (measured); off = total requests (derived — no cache → every request upstream) | 10 → 5 (**50%**) |
+| **Latency p50/p95 (cold vs warm)** | per-call wall-clock, split by the cold/warm design | **1188 ms → 2.7 ms** (~440×) |
+| **Tool-calls/question** | `1.0` in direct mode; real count via `--mode agent` | 1.0 (direct) |
+| **Retry recovery** | parsed from `[retry]` stderr lines; recovered = sequences − retryable errors | 4 attempts, 4/4 recovered |
+
+```bash
+python metrics.py              # direct: deterministic, no Groq quota (numbers above are from a real run)
+python metrics.py --mode agent  # route through the LLM to measure real tool-calls/question (needs Groq)
+python metrics.py --selftest     # verify the parsing/aggregation math offline
+```
+
+> Design choice: server-side metrics (cache/latency/retry) are driven by **direct tool calls** so they're deterministic and reproducible — only tool-calls-per-question needs the LLM. "Caching off" is *derived* from the stats rather than re-run, to avoid burning the 25/day Alpha Vantage cap.
+
+### 2. Tool-selection benchmark — `eval_agent.py`
+
+A ~40-case benchmark (all 6 tools + multi-tool + ambiguous) reporting **tool-selection accuracy** as `passed/total` with a per-category breakdown. Each case has a question, the acceptable `expected` tool(s), and an `any`/`all` match mode (`any` = picked an acceptable tool; `all` = picked every required tool, for multi-tool questions). Mocked mode (a deterministic keyword model) is a clean sweep that validates the harness; `--live` measures the real model's accuracy.
+
+```bash
+python eval_agent.py            # mocked: 42/42 (harness check, offline)
+python eval_agent.py --live      # real Groq tool-selection accuracy
+```
+
+### 3. Multi-model comparison — `compare_models.py`
+
+Runs the benchmark across several Groq models and prints accuracy / avg latency / tool-calls-per-question side by side. Models verified available on the free tier: `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `meta-llama/llama-4-scout-17b-16e-instruct`.
+
+```bash
+python compare_models.py                 # mocked (offline; identical rows — harness check)
+python compare_models.py --live           # real comparison (small subset by default)
+python compare_models.py --live --full     # all 42 cases (heavy — likely exceeds the free daily token budget)
+python compare_models.py --live --models "llama-3.1-8b-instant,qwen/qwen3-32b"
+```
+
+Built for the free tier: a **small category-balanced subset by default** (1 case/category), deliberate **throttling** (~4 s/question to stay under 30 rpm), **backoff** on 429s, and **per-model resume** — results are saved after each model, and a rate-limit hit stops cleanly so re-running skips the finished models. (Real cross-model numbers require a fresh Groq daily token budget; the table format is the same shape as the mocked run.)
+
+### 4. W&B Weave tracing (optional) — `weave_setup.py`
+
+[W&B Weave](https://wandb.ai/site/weave) is the **hosted equivalent of the JSONL tracer** — it records each agent run (reasoning, tool calls, results, latency) and eval summaries to a dashboard. This is **observability / eval-tracking, NOT model training** (it's Weave, not W&B Models — no weights or gradients).
+
+It is **strictly optional**: the core loop never imports `weave`, and everything degrades to a no-op when the flag is off, the package isn't installed, or `WANDB_API_KEY` is unset.
+
+```bash
+# one-time, only if you want hosted tracing:
+.venv/Scripts/python.exe -m pip install -r requirements-weave.txt
+# set WANDB_API_KEY (https://wandb.ai/authorize), then add --weave (or WEAVE_ENABLED=1):
+python eval_agent.py --live --weave
+python compare_models.py --live --weave
+```
+
+How it's wired: the runner (`run_agent`) and the graph's agent node are decorated with an optional `@op` that becomes a `weave.op()` only when Weave is active. Each eval/comparison tags its traces (`eval=…`, `model=…`) and logs a summary, so model runs are filterable and comparable in the dashboard.
 
 ## Project layout
 
@@ -414,10 +477,14 @@ fin-mcp/
 │   ├── agent.py               # Phase 3: the StateGraph reason→act→observe agent (the core)
 │   ├── phase3_run.py          # Phase 3: run a single-tool question
 │   ├── phase4_multistep.py    # Phase 4: streamed multi-step demonstration
-│   ├── runner.py              # shared streaming runner → RunResult (+ optional tracing)
+│   ├── runner.py              # shared streaming runner → RunResult (+ optional tracing/Weave op)
 │   ├── tracing.py             # Phase 5: JSONL Tracer
-│   ├── eval_agent.py          # Phase 5: tool-selection eval (mocked default, --live flag)
+│   ├── eval_agent.py          # tool-selection benchmark (~40 cases; mocked default, --live, --weave)
+│   ├── metrics.py             # Tier-1 metrics report (cache/latency/retry/reduction)
+│   ├── compare_models.py      # multi-model comparison table (resumable, throttled)
+│   ├── weave_setup.py         # optional W&B Weave observability (no-op unless enabled)
 │   ├── requirements.txt
+│   ├── requirements-weave.txt  # optional Weave extra
 │   └── .env.example
 ├── package.json
 ├── tsconfig.json

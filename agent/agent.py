@@ -40,6 +40,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
+from weave_setup import op  # optional Weave tracing; no-op unless Weave is active
+
 MODEL_NAME = "llama-3.3-70b-versatile"
 
 # A small pause before each model call so a tool-heavy loop stays comfortably
@@ -156,7 +158,8 @@ def build_graph(tools: list[BaseTool], model: ChatGroq | None = None):
 
     # ── LangGraph: assemble the StateGraph ──
     graph = StateGraph(AgentState)
-    graph.add_node("agent", agent_node)
+    # op(...) traces the reason step as a Weave op when active; identity otherwise.
+    graph.add_node("agent", op(agent_node))
     graph.add_node("tools", tool_node)
     graph.add_edge(START, "agent")                                  # entry → reason
     graph.add_conditional_edges("agent", route, {"tools": "tools", END: END})

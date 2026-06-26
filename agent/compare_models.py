@@ -35,6 +35,7 @@ from agent import _is_rate_limit, build_graph, make_model
 from eval_agent import CASES, EvalCase, FakeToolModel, _build_stub_tools, _score
 from runner import run_agent
 from tracing import Tracer
+from weave_setup import attributes, init_weave, log_summary, weave_requested
 
 # Verified available on the free tier (see `client.models.list()`); all support tools.
 DEFAULT_MODELS = [
@@ -170,6 +171,9 @@ async def main() -> None:
     if "--models" in argv:
         models = [m.strip() for m in argv[argv.index("--models") + 1].split(",") if m.strip()]
 
+    # Optional W&B Weave tracing (--weave / WEAVE_ENABLED); no-op otherwise.
+    init_weave(weave_requested(argv))
+
     cases = CASES if full else pick_subset(CASES)
     mode = "live" if live else "mock"
     out_path = Path(f"traces/compare-models-{mode}.json")
@@ -191,9 +195,17 @@ async def main() -> None:
                 print(f"  [skip] {model} — already complete ({prior['passed']}/{prior['completed']})")
                 continue
             print(f"  [run ] {model} ...")
-            result = await evaluate_model(model, cases, tracer, live=live, delay=LIVE_QUESTION_DELAY if live else 0.0)
+            # Tag this model's Weave traces so models are comparable in the dashboard.
+            with attributes(eval="model-comparison", model=model, mode=mode):
+                result = await evaluate_model(model, cases, tracer, live=live,
+                                              delay=LIVE_QUESTION_DELAY if live else 0.0)
             results[model] = asdict(result)
             _save(out_path, results)  # persist after EACH model → resumable
+            log_summary(f"compare:{model}",
+                        {"model": model, "accuracy": round(result.accuracy, 4),
+                         "avg_latency_s": round(result.avg_latency_s, 3),
+                         "avg_tool_calls": round(result.avg_tool_calls, 3),
+                         "completed": result.completed, "total": result.total})
             print(f"         {result.passed}/{result.completed} passed"
                   f"{'  [RATE-LIMITED, stopping]' if result.status != 'ok' else ''}")
             if result.status != "ok":

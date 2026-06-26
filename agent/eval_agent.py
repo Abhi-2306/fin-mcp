@@ -44,6 +44,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from agent import build_graph, make_model
 from runner import run_agent
 from tracing import Tracer
+from weave_setup import attributes, init_weave, log_summary, weave_requested
 
 # Tool name constants (keep typos out of the case table).
 PRICE = "get_stock_price"
@@ -340,6 +341,9 @@ async def main() -> None:
         pass
 
     live = "--live" in sys.argv
+    # Optional W&B Weave tracing (--weave / WEAVE_ENABLED); no-op otherwise.
+    init_weave(weave_requested(sys.argv))
+
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     trace_path = f"traces/eval-{'live' if live else 'mock'}-{stamp}.jsonl"
 
@@ -349,7 +353,16 @@ async def main() -> None:
 
     with Tracer(trace_path) as tracer:
         tracer.event(event="run_start", mode=("live" if live else "mock"), cases=len(CASES))
-        scored = await (run_live(tracer) if live else run_mocked(tracer))
+        # Tag every Weave trace from this suite so it's grouped in the dashboard.
+        with attributes(eval="tool-selection", mode=("live" if live else "mock")):
+            scored = await (run_live(tracer) if live else run_mocked(tracer))
+
+    passed = sum(s.passed for s in scored)
+    total = len(scored)
+    # Log the eval summary to Weave (comparable alongside other runs/models).
+    log_summary(f"tool-selection-{'live' if live else 'mock'}",
+                {"passed": passed, "total": total,
+                 "accuracy": round(passed / total, 4) if total else 0.0})
 
     sys.exit(_print_report(scored))
 
