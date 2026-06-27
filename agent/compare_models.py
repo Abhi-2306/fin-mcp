@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from agent import _is_rate_limit, build_graph, make_model
-from eval_agent import CASES, EvalCase, FakeToolModel, _build_stub_tools, _score
+from eval_agent import CASES, EvalCase, FakeToolModel, _build_stub_tools, _score, pick_subset
 from runner import run_agent
 from tracing import Tracer
 from weave_setup import attributes, init_weave, log_summary, weave_requested
@@ -63,17 +63,6 @@ class ModelResult:
         return (self.passed / self.completed) if self.completed else 0.0
 
 
-def pick_subset(cases: list[EvalCase], per_category: int = 1) -> list[EvalCase]:
-    """A small, category-balanced subset for a quick (daily-budget-friendly) run."""
-    counts: dict[str, int] = {}
-    out: list[EvalCase] = []
-    for c in cases:
-        if counts.get(c.category, 0) < per_category:
-            out.append(c)
-            counts[c.category] = counts.get(c.category, 0) + 1
-    return out
-
-
 async def evaluate_model(
     model_name: str, cases: list[EvalCase], tracer: Tracer, *, live: bool, delay: float
 ) -> ModelResult:
@@ -89,13 +78,22 @@ async def evaluate_model(
             t0 = time.perf_counter()
             try:
                 result = await run_agent(graph, case.question, tracer=tracer)
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:  # noqa: BLE001 — one bad case must not crash the comparison
                 # Caught INSIDE the session so it never escapes as an ExceptionGroup.
                 if _is_rate_limit(err):
                     status = "partial (rate-limited)"
                     tracer.event(event="stopped", model=model_name, reason="rate_limit", completed=completed)
                     return
-                raise
+                # Any other per-case failure (e.g. a small model loops and hits the
+                # recursion cap → GraphRecursionError) counts as a FAILED case for
+                # this model. Record it (completed but not passed) and continue —
+                # this is itself a meaningful comparison signal.
+                completed += 1
+                lat_sum += time.perf_counter() - t0
+                tracer.event(event="case_error", model=model_name, index=i, error=type(err).__name__)
+                if delay and i < len(cases):
+                    await asyncio.sleep(delay)
+                continue
             latency = time.perf_counter() - t0
             completed += 1
             lat_sum += latency
@@ -120,7 +118,7 @@ async def evaluate_model(
     else:
         # Mock: the FakeToolModel ignores the model id, so rows will be identical.
         # This run only verifies the harness/table/resume — not real differences.
-        await run_with(build_graph(_build_stub_tools(), model=FakeToolModel()))
+        await run_with(build_graph(_build_stub_tools(), model=FakeToolModel(), iter_delay=0.0))
 
     avg_lat = lat_sum / completed if completed else 0.0
     avg_tc = tool_sum / completed if completed else 0.0

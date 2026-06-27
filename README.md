@@ -433,7 +433,19 @@ python compare_models.py --live --full     # all 42 cases (heavy — likely exce
 python compare_models.py --live --models "llama-3.1-8b-instant,qwen/qwen3-32b"
 ```
 
-Built for the free tier: a **small category-balanced subset by default** (1 case/category), deliberate **throttling** (~4 s/question to stay under 30 rpm), **backoff** on 429s, and **per-model resume** — results are saved after each model, and a rate-limit hit stops cleanly so re-running skips the finished models. (Real cross-model numbers require a fresh Groq daily token budget; the table format is the same shape as the mocked run.)
+Built for the free tier: a **small category-balanced subset by default** (1 case/category), deliberate **throttling** (~4 s/question to stay under 30 rpm), **backoff** on 429s, and **per-model resume** — results are saved after each model, and a rate-limit hit stops cleanly so re-running skips the finished models.
+
+**Live results** (8-case subset, real Groq):
+
+| Model | Tool-selection accuracy | Avg latency/question | Tool calls/question |
+|-------|------------------------|----------------------|---------------------|
+| `llama-3.3-70b-versatile` | 100% (8/8) | 16.84 s | 2.00 |
+| `llama-3.1-8b-instant` | 87.5% (7/8) | 16.60 s | 1.25 |
+| `meta-llama/llama-4-scout-17b-16e-instruct` | **100% (8/8)** | **7.37 s** | **1.12** |
+
+Takeaway: **Llama-4-Scout was the sweet spot** — matched the 70B's accuracy at under half the latency and the fewest tool calls per question. The 70B was accurate but slowest and called ~2 tools/question (some redundancy); the 8B was the weakest on accuracy.
+
+> Caveat: avg-latency is sensitive at n=8. The 8B's 16.6 s is **inflated by its one failing case** — a case where it looped to the recursion cap (~15 LLM calls), which drags the mean up; on the cases it handled cleanly the 8B is fast. Treat these as directional, not benchmark-grade — widen the subset (`--full`, budget permitting) for tighter numbers.
 
 ### 4. W&B Weave tracing (optional) — `weave_setup.py`
 

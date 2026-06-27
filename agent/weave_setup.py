@@ -24,6 +24,9 @@ import contextlib
 import functools
 import os
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 _weave = None       # the weave module, once successfully imported + initialized
 _active = False     # True only after a successful weave.init()
@@ -45,6 +48,9 @@ def init_weave(enabled: bool, project: str = "fin-mcp-agent") -> bool:
     global _weave, _active
     if not enabled:
         return False
+    # Load agent/.env so WANDB_API_KEY is visible even in mock mode (where
+    # make_model - which otherwise loads .env - is never called).
+    load_dotenv(Path(__file__).resolve().parent / ".env")
     try:
         import weave  # optional dependency - only imported when explicitly enabled
     except ImportError:

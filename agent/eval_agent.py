@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 
-from agent import build_graph, make_model
+from agent import _is_rate_limit, build_graph, make_model
 from runner import run_agent
 from tracing import Tracer
 from weave_setup import attributes, init_weave, log_summary, weave_requested
@@ -268,32 +268,61 @@ def _score(case: EvalCase, result, live: bool) -> Scored:
     return Scored(case=case, passed=passed, detail=detail)
 
 
-async def _run_cases(graph, tracer: Tracer, *, delay: float, live: bool) -> list[Scored]:
+def pick_subset(cases: list[EvalCase], per_category: int = 1) -> list[EvalCase]:
+    """A small, category-balanced subset — for live runs on a tight token budget."""
+    counts: dict[str, int] = {}
+    out: list[EvalCase] = []
+    for c in cases:
+        if counts.get(c.category, 0) < per_category:
+            out.append(c)
+            counts[c.category] = counts.get(c.category, 0) + 1
+    return out
+
+
+def _case_line(s: Scored) -> None:
+    """Print one case result (streamed live so long runs don't look hung)."""
+    tag = "PASS" if s.passed else "FAIL"
+    q = s.case.question if len(s.case.question) <= 52 else s.case.question[:52] + "…"
+    print(f"  [{tag}] ({s.case.category:9}) {q}")
+    if not s.passed:
+        print(f"           |- {s.detail}")
+
+
+async def _run_cases(graph, tracer: Tracer, cases: list[EvalCase], *, delay: float, live: bool) -> list[Scored]:
     scored: list[Scored] = []
-    for i, case in enumerate(CASES, 1):
+    for i, case in enumerate(cases, 1):
         tracer.event(event="case_start", index=i, question=case.question,
                      expected=sorted(case.expected), match=case.match)
         try:
             result = await run_agent(graph, case.question, tracer=tracer)
-            scored.append(_score(case, result, live))
+            s = _score(case, result, live)
         except Exception as err:  # noqa: BLE001 — one bad case must not sink the suite
+            if _is_rate_limit(err):
+                # Persistent (esp. daily) cap: stop early & report partial rather
+                # than grinding every remaining case through futile retries.
+                print(f"\n  ! Groq rate/token limit reached after {len(scored)}/{len(cases)} cases"
+                      " - stopping early (partial accuracy below).", file=sys.stderr)
+                tracer.event(event="stopped", reason="rate_limit", completed=len(scored))
+                break
             reason = str(err).replace("\n", " ")
             if len(reason) > 140:
                 reason = reason[:140] + " ..."
             tracer.event(event="case_error", index=i, error=f"{type(err).__name__}: {reason}")
-            scored.append(Scored(case=case, passed=False,
-                                 detail=f"errored: {type(err).__name__}: {reason}"))
-        if delay and i < len(CASES):
+            s = Scored(case=case, passed=False, detail=f"errored: {type(err).__name__}: {reason}")
+        scored.append(s)
+        _case_line(s)  # stream progress as each case finishes
+        if delay and i < len(cases):
             await asyncio.sleep(delay)
     return scored
 
 
-async def run_mocked(tracer: Tracer) -> list[Scored]:
-    graph = build_graph(_build_stub_tools(), model=FakeToolModel())
-    return await _run_cases(graph, tracer, delay=0.0, live=False)
+async def run_mocked(tracer: Tracer, cases: list[EvalCase]) -> list[Scored]:
+    # iter_delay=0: no real API in mock mode, so don't pause (keeps it fast).
+    graph = build_graph(_build_stub_tools(), model=FakeToolModel(), iter_delay=0.0)
+    return await _run_cases(graph, tracer, cases, delay=0.0, live=False)
 
 
-async def run_live(tracer: Tracer) -> list[Scored]:
+async def run_live(tracer: Tracer, cases: list[EvalCase]) -> list[Scored]:
     from langchain_mcp_adapters.tools import load_mcp_tools
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
@@ -305,18 +334,11 @@ async def run_live(tracer: Tracer) -> list[Scored]:
             await session.initialize()
             tools = await load_mcp_tools(session)
             graph = build_graph(tools, model=make_model())
-            return await _run_cases(graph, tracer, delay=LIVE_INTER_CASE_DELAY, live=True)
+            return await _run_cases(graph, tracer, cases, delay=LIVE_INTER_CASE_DELAY, live=True)
 
 
 def _print_report(scored: list[Scored]) -> int:
-    # Per-case lines.
-    for s in scored:
-        tag = "PASS" if s.passed else "FAIL"
-        q = s.case.question if len(s.case.question) <= 52 else s.case.question[:52] + "…"
-        print(f"  [{tag}] ({s.case.category:9}) {q}")
-        if not s.passed:
-            print(f"           |- {s.detail}")
-
+    # (Per-case lines were already streamed by _run_cases.) Summary follows.
     # Per-category accuracy.
     cats: dict[str, list[Scored]] = {}
     for s in scored:
@@ -341,6 +363,8 @@ async def main() -> None:
         pass
 
     live = "--live" in sys.argv
+    # --subset: a category-balanced ~8-case slice (fits a tight daily token budget).
+    cases = pick_subset(CASES) if "--subset" in sys.argv else CASES
     # Optional W&B Weave tracing (--weave / WEAVE_ENABLED); no-op otherwise.
     init_weave(weave_requested(sys.argv))
 
@@ -348,14 +372,17 @@ async def main() -> None:
     trace_path = f"traces/eval-{'live' if live else 'mock'}-{stamp}.jsonl"
 
     mode = "LIVE (real Groq + real server)" if live else "mocked (offline)"
-    print(f"\n  agent tool-selection eval - {mode} - {len(CASES)} cases")
+    print(f"\n  agent tool-selection eval - {mode} - {len(cases)} cases")
     print(f"  trace: {trace_path}\n")
 
     with Tracer(trace_path) as tracer:
-        tracer.event(event="run_start", mode=("live" if live else "mock"), cases=len(CASES))
+        tracer.event(event="run_start", mode=("live" if live else "mock"), cases=len(cases))
         # Tag every Weave trace from this suite so it's grouped in the dashboard.
         with attributes(eval="tool-selection", mode=("live" if live else "mock")):
-            scored = await (run_live(tracer) if live else run_mocked(tracer))
+            scored = await (run_live(tracer, cases) if live else run_mocked(tracer, cases))
+
+    if len(scored) < len(cases):
+        print(f"  (partial: {len(scored)}/{len(cases)} cases ran before stopping)\n")
 
     passed = sum(s.passed for s in scored)
     total = len(scored)

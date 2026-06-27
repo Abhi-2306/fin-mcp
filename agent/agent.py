@@ -105,18 +105,26 @@ def _is_rate_limit(err: Exception) -> bool:
     return "429" in text or "rate limit" in text
 
 
+def _is_daily_limit(err: Exception) -> bool:
+    """A *daily* token cap (TPD) — unlike a per-minute 429, backoff can't fix it today."""
+    text = str(err).lower()
+    return "per day" in text or "tpd" in text
+
+
 async def _ainvoke_with_backoff(model, messages, max_attempts: int = 4):
-    """Call the model, retrying ONLY on rate limits with exponential backoff.
+    """Call the model, retrying ONLY on TRANSIENT rate limits with exponential backoff.
 
     This is our own safety net on top of ChatGroq's max_retries, because the
-    free tier's 30 req/min is easy to trip during a multi-step loop.
+    free tier's 30 req/min is easy to trip during a multi-step loop. A *daily*
+    token cap is raised immediately — retrying it just wastes time until reset.
     """
     delay = 2.0
     for attempt in range(max_attempts):
         try:
             return await model.ainvoke(messages)
         except Exception as err:  # noqa: BLE001 — we re-raise anything non-429
-            if _is_rate_limit(err) and attempt < max_attempts - 1:
+            transient = _is_rate_limit(err) and not _is_daily_limit(err)
+            if transient and attempt < max_attempts - 1:
                 print(f"[rate-limit] Groq 429; backing off {delay:.0f}s", file=sys.stderr)
                 await asyncio.sleep(delay)
                 delay *= 2
@@ -124,15 +132,21 @@ async def _ainvoke_with_backoff(model, messages, max_attempts: int = 4):
             raise
 
 
-def build_graph(tools: list[BaseTool], model: ChatGroq | None = None):
-    """Build and compile the agent graph against a set of (live) LangChain tools."""
+def build_graph(tools: list[BaseTool], model: ChatGroq | None = None,
+                iter_delay: float = ITER_DELAY_SECONDS):
+    """Build and compile the agent graph against a set of (live) LangChain tools.
+
+    `iter_delay` is the pre-call pause that keeps live runs under the rate limit;
+    pass 0 for mocked/offline runs (no real API → no need to wait, no false hang).
+    """
     model = model or make_model()
     # LangChain: bind the tool schemas so the model can emit `tool_calls`.
     model_with_tools = model.bind_tools(tools)
 
     # ── node (a) — the "reason" step: ask the model what to do next ──
     async def agent_node(state: AgentState) -> dict:
-        await asyncio.sleep(ITER_DELAY_SECONDS)  # gentle on the rate limit
+        if iter_delay:
+            await asyncio.sleep(iter_delay)  # gentle on the rate limit (live only)
         # System prompt is prepended fresh each turn; history is accumulated state.
         messages = [SystemMessage(SYSTEM_PROMPT), *state["messages"]]
         response = await _ainvoke_with_backoff(model_with_tools, messages)
